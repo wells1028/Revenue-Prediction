@@ -1,0 +1,464 @@
+---
+title: "Sales Tax Revenue Model"
+author: "Trish Wells"
+date: "5/3/2021"
+output: html_document
+---
+
+
+## Overview of Basic Steps Performed:
+
+# Clean and impute raw data.
+# Difference and normalize variables.
+# Add all dummy and interaction variables we want to test for significance.
+# Create lists of all possible combinations of exogenous variables.
+# Create a separate auto arima for each combination and store its AICc score in a new df.
+# Find the model with the lowest AICc score.
+# Use this model to forecast.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(forecast)
+library(tidyverse)
+library(lubridate)
+library(pander)
+library(hablar)
+library(dynlm)
+library(caret)
+library(tseries)
+library(pastecs)
+library(imputeTS)
+library(gridExtra)
+library(stringr)
+library(combinat)
+library(DescTools)
+library(purrr)
+library(MuMIn)
+library(progress)
+```
+
+## Pull in raw file and clean/impute.
+
+```{r CleanRaw}
+
+rawsalestax<-read_csv("CorrectedSalesTaxByMonth2.csv")
+
+#Change date column type
+salestax <- rawsalestax %>%
+  mutate(ReceivedTransDate = mdy(ReceivedTransDate))
+
+#Rename columns
+salestax <- salestax %>% rename(Date = ReceivedTransDate, CS = ICS_ALL, CEA = WAPHCI)
+
+#Turn CPI into dbl 
+salestax <- salestax %>% convert(num(CPI))
+
+#Impute missing CPI values using Kalman smoothing
+salestax$CPI <- na_kalman(salestax$CPI)
+
+# Move sales tax revenue backwards two months to align revenues with the month they were earned.
+## Create a dataframe with only the sales tax revenue
+salestaxtemp <- salestax[,2, drop=FALSE]
+
+## Add two more months of data to the end
+onemonth <- 2187197
+
+salestaxtemp2 <- rbind(salestaxtemp, onemonth) 
+
+twomonth <- 1973845
+
+salestaxtemp3 <- rbind(salestaxtemp2, twomonth) 
+
+# tail(salestaxtemp3,10)
+
+## Get rid of first two obs 
+adjsalestx <- salestaxtemp3[-1,]
+finaladjsalestx <- adjsalestx[-1,]
+
+# Now replace the sales tax column within the dataframe we are going to use
+salestax$SalesTax <- finaladjsalestx$SalesTax
+
+# Cut off at 2020
+salestax <- salestax %>% filter(Date < as.Date("2020-01-01"))
+# tail(salestax,6)
+
+# Write to csv
+write.csv(salestax, "C:/Users/wells/Desktop/R City/Final Model/salestax.csv", row.names=FALSE)
+
+```
+
+
+## Clean up unused objects and reload cleaned file
+
+```{r Importsalestax}
+rm(list = ls())
+salestax <- read_csv("salestax.csv")
+```
+
+## Test sales tax for stationarity
+
+```{r ADFTest}
+#Make Time Series
+ts <- ts(salestax[-1,2], start=c (2012,4), frequency =12)
+
+#Test for stationarity
+adf.test(ts)
+# Stationary, but we are using auto arima so it doesn't really make a difference because it will difference the data for us, if necessary.
+```
+
+## Variable transformation
+
+```{r Histograms}
+hist(salestax$SalesTax)
+hist(salestax$HomesSold)
+hist(salestax$UnemploymentRate)
+hist(salestax$CPI)
+hist(salestax$NewHousingUnits)
+hist(salestax$CEA)
+hist(salestax$NewRegistrations)
+hist(salestax$CS)
+```
+
+```{r Differencing}
+salestaxdiff <- data.frame(salestax[-1,1:2],
+                           HomesSold = diff(salestax$HomesSold),
+                           UnemploymentRate = diff(salestax$UnemploymentRate),
+                           CPI = diff(salestax$CPI),
+                           NewHousing = diff(salestax$NewHousingUnits),
+                           CEA = diff(salestax$CEA),
+                           NewReg = diff(salestax$NewRegistrations),
+                           CS = diff(salestax$CS))
+
+```
+
+```{r NewHistograms}
+hist(salestaxdiff$HomesSold)
+hist(salestaxdiff$UnemploymentRate)
+hist(salestaxdiff$CPI)
+hist(salestaxdiff$NewHousing)
+hist(salestaxdiff$CEA)
+hist(salestaxdiff$NewReg)
+hist(salestaxdiff$CS)
+```
+
+
+## Now normalize.
+
+```{r Normalize}
+preProcdiff <- preProcess(salestaxdiff[,c(2:9)], method=c("center", "scale"))
+normdiff <- predict(preProcdiff, salestaxdiff[,c(2:9)])
+df <- data.frame(Date = salestaxdiff$Date, normdiff)
+
+
+```
+
+## Add dummy variables for xmas, fair, and annual filers.
+
+```{r Dummies}
+df$xmas <- if_else(paste(str_pad(month(df$Date), 2, pad = "0"),
+                      sep = "-") %in% "12", 1, 0)
+
+df$fair <- if_else(paste(str_pad(month(df$Date), 2, pad = "0"),
+                      sep = "-") %in% "09", 1, 0)
+
+df$annual <- if_else(paste(str_pad(month(df$Date), 2, pad = "0"),
+                            sep = "-") %in% "02", 1, 0)
+
+
+# Correct annual filers for 2019
+tail(df, 20)
+df[83, 12] <- 0
+df[84, 12] <- 1
+tail(df, 20)
+
+```
+
+## Add interaction variables & round to four digits
+
+```{r Interaction}
+df$UR_Xmas <- df$UnemploymentRate * df$xmas
+df$UR_Fair <- df$UnemploymentRate * df$fair
+df$CEA_Xmas <- df$CEA * df$xmas
+
+
+df <- df %>% mutate_if(is.numeric, round, digits=4)
+
+
+```
+
+## Clear unused objects
+
+```{r Cleanup}
+rm(normdiff, preProcdiff, salestaxdiff, salestax)
+
+```
+
+
+## Create ts to be used in modeling (updated with normalized values)
+
+```{r Index}
+
+ts <- ts(df[,2], start=c (2012,4), frequency =12)
+
+
+```
+
+## Create list of all combinations of exogenous variables, with the exception of the interaction variables.
+# (Interaction variables can cause rank deficiency errors in the model creation phase. We will add them into our model later.)
+# We need to create two separate groups of exogenous variables and test them separately. See reasoning below.
+
+```{r}
+# CEA is comprised of nonfarm payroll employment, unemployment, average hours worked in mfg and wages/salaries. So, we cannot use CEA, UR, and CPI in a model together.
+
+# So, we will create two separate variable groups that minimizes covariances and rank deficiency errors. Then conduct training on the two variable groups separately, then add interaction variables and conduct the training again.
+
+vgroup1 <- c("HomesSold",
+             "NewHousing",
+             "CEA",
+             "NewReg",
+             "CS",
+             "annual")
+
+combo_list1 <- list()
+
+for (i in 1:length(vgroup1)) {
+   combo_list1[[i]] <- DescTools::CombSet(vgroup1, i, 
+                                         repl = FALSE, 
+                                         ord = FALSE, 
+                                         as.list = TRUE)
+}
+
+combo_list1 <- purrr::flatten(combo_list1)
+length(combo_list1)
+# There are 63 possible combinations of these 6 variables. We will create an auto arima for each combination and note the lowest AICc score.
+
+
+vgroup2 <- c("HomesSold",
+             "NewHousing",
+             "UnemploymentRate",
+             "CPI",
+             "NewReg",
+             "CS",
+             "annual")
+
+
+combo_list2 <- list()
+
+for (i in 1:length(vgroup2)) {
+   combo_list2[[i]] <- DescTools::CombSet(vgroup2, i, 
+                                         repl = FALSE, 
+                                         ord = FALSE, 
+                                         as.list = TRUE)
+}
+
+combo_list2 <- purrr::flatten(combo_list2)
+length(combo_list2)
+# There are 127 possible combinations of these 7 variables.
+
+# Now we need to create a model for all 190 variable combinations so we can identify the model with the lowest AICc score.
+
+```
+
+
+## Initialize dataframe to save the AICc scores of the first variable group.
+
+```{r }
+
+v1AICcs <- data.frame(Iteration = seq(1, length(combo_list1), 1), AICc = rep(0, length(combo_list1)))
+
+```
+
+## Model all combos of variable group 1 and save AICc scores in the v1AICc df.
+
+```{r}
+# Create Progress Bar to be used in our loop so we know how long it will take
+pb <- progress_bar$new(
+format = " training [:bar] :percent in :elapsed",
+total = length(combo_list1), clear = FALSE, width= 60)
+
+# Loop to test all combinations of our variables and store the AICc in the AICc df.
+for(i in 1:length(combo_list1)) {
+pb$tick()
+Sys.sleep(1 / 100)
+matrix <- as.matrix(df[, combo_list1[[i]]])
+
+v1AICcs[i,2] <- AICc(auto.arima(window(ts, c(2012, 4), c(2012, 4+92)), xreg = matrix))
+
+}
+
+
+```
+
+## See which model had lowest AICc
+
+```{r}
+summary(v1AICcs)
+v1AICcs %>% arrange(AICc) %>% head(10)
+# i=20
+# AICc = -70.37147
+combo_list1[[20]]
+# (New Reg, annual) is the exogenous variable combination with the lowest AICc.
+
+```
+
+## Initialize dataframe to save group 2 AICc scores.
+
+```{r }
+
+v2AICcs <- data.frame(Iteration = seq(1, length(combo_list2), 1), AICc = rep(0, length(combo_list2)))
+
+```
+
+## Model all combos of variable group 2 and save AICcs
+
+```{r}
+pb <- progress_bar$new(
+format = " training [:bar] :percent in :elapsed",
+total = length(combo_list2), clear = FALSE, width= 60)
+
+for(i in 1:length(combo_list2)) {
+pb$tick()
+Sys.sleep(1 / 100)
+matrix <- as.matrix(df[, combo_list2[[i]]])
+
+v2AICcs[i,2] <- AICc(auto.arima(window(ts, c(2012, 4), c(2012, 4+92)), xreg = matrix))
+
+}
+
+
+```
+
+## See which model had lowest AICc
+
+```{r}
+summary(v2AICcs)
+v2AICcs %>% arrange(AICc) %>% head(10)
+# i= 27
+# AICc = -70.37147
+combo_list2[[27]]
+# (New Reg, annual)
+# Even in this new variable group, New Reg and Annual give the lowest AICc.
+
+```
+
+
+
+## Now that we have the significant variables, let's add in other dummies and interaction variables. 
+# These were excluded from the original testing for two reasons. First, including them with the original variable groups would have resulted in 8,000+ variable combinations which would take 5+ hours to model. Second, many of those combinations would have the interaction variables paired with their components (e.g. UR with UR_Xmas), which breaks the model due to rank deficiency.
+
+```{r}
+# Our significant variables are NewReg & Annual. We will keep these variables and add in the remaining dummies and interaction variables. 
+
+vgroup4 <- c("NewReg",
+             "annual",
+             "xmas",
+             "fair",
+             "UR_Xmas",
+             "UR_Fair",
+             "CEA_Xmas")
+
+combo_list4 <- list()
+
+for (i in 1:length(vgroup4)) {
+   combo_list4[[i]] <- DescTools::CombSet(vgroup4, i, 
+                                         repl = FALSE, 
+                                         ord = FALSE, 
+                                         as.list = TRUE)
+}
+
+combo_list4 <- purrr::flatten(combo_list4)
+length(combo_list4)
+
+# Initial AICc df
+v4AICcs <- data.frame(Iteration = seq(1, length(combo_list4), 1), AICc = rep(0, length(combo_list4)))
+
+# Begin modeling process.
+pb <- progress_bar$new(
+format = " downloading [:bar] :percent in :elapsed",
+total = length(combo_list4), clear = FALSE, width= 60)
+
+for(i in 1:length(combo_list4)) {
+pb$tick()
+Sys.sleep(1 / 100)
+
+matrix <- as.matrix(df[, combo_list4[[i]]])
+
+v4AICcs[i,2] <- AICc(auto.arima(window(ts, c(2012, 4), c(2012, 4+92)), xreg = matrix))
+
+}
+
+
+# Identify lowest AICc
+summary(v4AICcs)
+v4AICcs %>% arrange(AICc) %>% head(10)
+# i=8
+# AICc = -70.37147
+combo_list4[[8]]
+# NewReg and annual. Even after adding dummies and interaction variables, only NewReg and annual are significant.
+```
+
+
+
+## Now we need to create our optimal model and save the summary. Note that due to our limited sample size, all of our previous models up until this point have been trained using ALL data (no train/test split). We needed to include 2019 in our training because it is the year that the annual filers flag changed from February to March. We wanted our model to incorporate this change and determine if this change had an effect on sales tax revenue, which it does.
+
+## However, when we create our final model, we need to use a train/test split in order to be able to forecast. If we were to create a model using New Reg and annual using a training split, the auto.arima would give us a different (p,d,q)(P,D,Q) with a much lower AICc. This is because the test data has the annual filer change which would not be incorporated into the training. So, we need to find the (p,d,q)(P,D,Q) from our model that was trained using all data, then manually create an arima model using those parameters.
+
+```{r}
+# Find and save model previously identified as best.
+matrix <- as.matrix(df[, combo_list4[[8]]])
+
+fit <- auto.arima(window(ts, c(2012, 4), c(2012, 4+92)), xreg = matrix)
+
+fitsummary <- (summary(fit))
+
+# Parameters of best fit model is (0,0,3)(0,1,1) with drift.
+
+# Now we want to manually create an arima using these parameters, but using a train/test split. We will train on all data through 2018. We will forecast 2019.
+
+# Create train/test split
+train <- 1:81
+test <- 82:93
+
+# Create manual model
+matrixmanual <- as.matrix(df[train, combo_list4[[8]]])
+fitmanual <- Arima(window(ts, c(2012, 4), c(2012, 4+(81-1))),
+           xreg = matrixmanual,
+           order = c(0,0,3),
+           season = c(0,1,1),
+           include.drift = TRUE)
+```
+
+
+## This returns an error. This error is caused by the perfect correlation between annual and date. In the training data, the annual flag is always in February, so it does not add anything to the model. To get around this, we will use New Reg only. The downside is that our model will not take into account annual filers at all, resulting in a big error in our 2019 forecast when they change the month that annual filers revenues are received.
+
+
+```{r}
+# Create manual model with New Reg only
+matrixmanual <- as.matrix(df[train, combo_list4[[1]]])
+fitfinal <- Arima(window(ts, c(2012, 4), c(2012, 4+(81-1))),
+           xreg = matrixmanual,
+           order = c(0,0,3),
+           season = c(0,1,1),
+           include.drift = TRUE)
+
+fitfinalsummary <- (summary(fitfinal))
+
+# Compare the differences between the model created on all data vs using train/test split.
+fitsummary
+fitfinalsummary
+# They're pretty close!
+
+```
+
+
+## Now we can create our prediction for 2019 and compare it to actual revenues.
+
+```{r}
+predmatrix <- as.matrix(df[test, combo_list4[[1]]])
+prediction <- forecast(fitfinal, xreg = predmatrix)
+plot(prediction)
+lines(window(ts, c(2012, 4+(69-1)), c(2012, 96)))
+
+```
+
